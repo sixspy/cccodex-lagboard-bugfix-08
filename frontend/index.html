@@ -59,8 +59,11 @@ createApp({
     const user=ref(localStorage.getItem('lagboard_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const sources=ref([]), arrivals=ref([]), catchups=ref([]);
-    const form=ref({source:'订单源', source_clock:'2026-11-16T10:00:00', ingest_clock:'2026-11-16T10:40:00'});
-    const nav=['到达登记','滞后分级','补齐恢复'];
+    const history=ref([]), policies=ref([]), cards=ref([]), watermark=ref([]), events=ref([]);
+    const form=ref({source:'订单源', source_clock:'2026-11-16T10:00:00', ingest_clock:'2026-11-16T10:40:00', seat:'补采席', expected_config_version:1});
+    const cfg=ref({source:'订单源', sla_minutes:15, collect_window_minutes:60, expected_config_version:1, seat:'配置席'});
+    const cfgErr=ref('');
+    const nav=['到达登记','时限台配置','滞后分级','补齐恢复','历史附页'];
     const frozen=computed(()=>sources.value.filter(s=>s.output_mode==='冻结').length);
     const degraded=computed(()=>sources.value.filter(s=>s.output_mode==='降级只读').length);
     function modeClass(m){return m==='冻结'?'bad':(m==='降级只读'?'warn':'ok');}
@@ -88,7 +91,37 @@ createApp({
       arrivals.value=Array.isArray(a.items)?a.items:[];
       const c=await loadJson('/api/catchups'); if(c===null) return;
       catchups.value=Array.isArray(c.items)?c.items:[];
+      const hi=await loadJson('/api/history'); if(hi===null) return;
+      history.value=Array.isArray(hi.items)?hi.items:[];
+      const po=await loadJson('/api/policies'); if(po===null) return;
+      policies.value=Array.isArray(po.items)?po.items:[];
+      const ca=await loadJson('/api/cutover-cards'); if(ca===null) return;
+      cards.value=Array.isArray(ca.items)?ca.items:[];
+      const wm=await loadJson('/api/watermark'); if(wm===null) return;
+      watermark.value=Array.isArray(wm.items)?wm.items:[];
+      const ev=await loadJson('/api/lag/events'); if(ev===null) return;
+      events.value=Array.isArray(ev.items)?ev.items:[];
       if(sources.value.length && !form.value.source) form.value.source=sources.value[0].name;
+      const fs=sources.value.find(x=>x.name===form.value.source);
+      if(fs) form.value.expected_config_version=fs.config_version;
+      syncCfg();
+    }
+    function syncCfg(){
+      const s=sources.value.find(x=>x.name===cfg.value.source)||sources.value[0];
+      if(!s) return;
+      cfg.value.source=s.name; cfg.value.sla_minutes=s.sla_minutes;
+      cfg.value.collect_window_minutes=s.collect_window_minutes;
+      cfg.value.expected_config_version=s.config_version;
+    }
+    async function saveConfig(){
+      cfgErr.value='';
+      const body={seat:cfg.value.seat, expected_config_version:cfg.value.expected_config_version};
+      body.sla_minutes=Number(cfg.value.sla_minutes);
+      body.collect_window_minutes=Number(cfg.value.collect_window_minutes);
+      const r=await fetch('/api/sources/'+encodeURIComponent(cfg.value.source),{method:'PATCH',headers:auth(),body:JSON.stringify(body)});
+      const j=await r.json().catch(()=>({}));
+      cfgErr.value=r.ok?(`新档 v${j.policy_version} · 重评 ${j.resecored} 条 · ${j.sla_minutes} 分`):(j.detail||'失败');
+      await refresh();
     }
     async function recordArrival(){
       actionErr.value='';
@@ -98,7 +131,7 @@ createApp({
     }
     async function doCatchup(name){await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});await refresh();}
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
+    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,history,policies,cards,watermark,events,form,cfg,cfgErr,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup,syncCfg,saveConfig};
   },
   template:`
   <div v-if="!token" class="login">
@@ -113,7 +146,7 @@ createApp({
       <p>左侧是各源当前输出态；右侧登记到达并做补齐恢复。</p>
       <div class="src" v-for="s in sources" :key="s.id">
         <b>{{s.name}}</b>
-        <span>SLA {{s.sla_minutes}} 分钟</span>
+        <span>SLA {{s.sla_minutes}} 分钟 · 档 v{{s.policy_version}}</span>
         <div class="mode" :class="modeClass(s.output_mode)">{{s.output_mode}}</div>
       </div>
       <div style="margin-top:18px;font-size:12px;color:#9db0cc">{{user}} · <a href="#" style="color:#fff" @click.prevent="logout">退出</a></div>
@@ -133,29 +166,59 @@ createApp({
           <div><label>源</label><select v-model="form.source"><option v-for="s in sources" :value="s.name">{{s.name}}</option></select></div>
           <div><label>源时钟</label><input v-model="form.source_clock"/></div>
           <div><label>摄入时钟</label><input v-model="form.ingest_clock"/></div>
+          <div><label>席位</label><select v-model="form.seat"><option>补采席</option><option>配置席</option></select></div>
         </div>
         <button class="primary" @click="recordArrival">计算滞后并更新输出态</button>
         <div class="err">{{actionErr}}</div>
         <div class="timeline" style="margin-top:16px">
           <div class="item" v-for="a in (arrivals||[]).slice(0,8)" :key="a.id">
-            <b>{{a.source}}</b> · 滞后 {{a.lag_minutes}} 分 · {{a.level}}
+            <b>{{a.source}}</b> · 滞后 {{a.lag_minutes}} 分 · {{a.level}} · 档 v{{a.policy_version}} · 计分 SLA {{a.scored_sla}} · {{a.settled?'已结':'未结'}}
             <div style="color:#64748b;font-size:12px">{{a.source_clock}} → {{a.ingest_clock}}</div>
           </div>
         </div>
       </div>
       <div class="card" v-show="tab===1">
-        <h3>分级规则</h3>
-        <p style="color:#64748b;font-size:13px">≤SLA 正常可写；≤2×SLA 告警降级只读；更久违约冻结。</p>
-        <table><thead><tr><th>源</th><th>SLA</th><th>输出态</th><th></th></tr></thead>
-        <tbody><tr v-for="s in sources" :key="'g'+s.id">
-          <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>{{s.output_mode}}</td>
-          <td><button class="ghost" @click="doCatchup(s.name)">补齐恢复</button></td>
-        </tr></tbody></table>
+        <h3>时限台配置</h3>
+        <p style="color:#64748b;font-size:13px">改口走甲路径：档位与未结到达重评分同一事务，遇挫整体回退。只改显示或调用乙路径会被拦下并记「滞后偏了」。</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px">
+          <div><label>源</label><select v-model="cfg.source" @change="syncCfg"><option v-for="s in sources" :value="s.name">{{s.name}}</option></select></div>
+          <div><label>SLA 分钟</label><input type="number" v-model="cfg.sla_minutes"/></div>
+          <div><label>采集窗口分钟</label><input type="number" v-model="cfg.collect_window_minutes"/></div>
+          <div><label>席位</label><select v-model="cfg.seat"><option>配置席</option><option>补采席</option></select></div>
+        </div>
+        <div style="color:#64748b;font-size:12px">当前配置版本 v{{cfg.expected_config_version}}（后交争用只记留痕）</div>
+        <button class="primary" @click="saveConfig">写入新档并重评分</button>
+        <div class="err">{{cfgErr}}</div>
+        <table style="margin-top:12px"><thead><tr><th>源</th><th>版本</th><th>SLA</th><th>路径</th><th>状态</th></tr></thead>
+        <tbody><tr v-for="p in policies" :key="p.id"><td>{{p.source}}</td><td>v{{p.version}}</td><td>{{p.sla_minutes}}</td><td>{{p.path}}</td><td>{{p.status}}</td></tr></tbody></table>
       </div>
       <div class="card" v-show="tab===2">
+        <h3>分级规则</h3>
+        <p style="color:#64748b;font-size:13px">≤SLA 正常可写；≤2×SLA 告警降级只读；更久违约冻结。</p>
+        <table><thead><tr><th>源</th><th>SLA</th><th>档位</th><th>输出态</th><th></th></tr></thead>
+        <tbody><tr v-for="s in sources" :key="'g'+s.id">
+          <td>{{s.name}}</td><td>{{s.sla_minutes}}</td><td>v{{s.policy_version}}</td><td>{{s.output_mode}}</td>
+          <td><button class="ghost" @click="doCatchup(s.name)">补齐恢复</button></td>
+        </tr></tbody></table>
+        <h3 style="margin-top:16px">水位牌</h3>
+        <table><thead><tr><th>源</th><th>正常</th><th>告警</th><th>违约</th><th>已结</th><th>档位</th><th>输出态</th></tr></thead>
+        <tbody><tr v-for="w in watermark" :key="'w'+w.source"><td>{{w.source}}</td><td>{{w.normal}}</td><td>{{w.alert}}</td><td>{{w.breach}}</td><td>{{w.settled}}</td><td>v{{w.policy_version}}</td><td>{{w.mode}}</td></tr></tbody></table>
+      </div>
+      <div class="card" v-show="tab===3">
         <h3>补齐记录</h3>
         <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>时间</th></tr></thead>
         <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+      </div>
+      <div class="card" v-show="tab===4">
+        <h3>历史附页（已结到达按封档旧档留痕）</h3>
+        <table><thead><tr><th>源</th><th>滞后</th><th>等级</th><th>计分档位</th><th>计分 SLA</th></tr></thead>
+        <tbody><tr v-for="x in history" :key="'h'+x.id"><td>{{x.source}}</td><td>{{x.lag_minutes}}</td><td>{{x.level}}</td><td>v{{x.policy_version}}</td><td>{{x.scored_sla}}</td></tr></tbody></table>
+        <h3 style="margin-top:16px">滞后切断卡</h3>
+        <table><thead><tr><th>源</th><th>路径</th><th>档位</th><th>重评</th><th>状态</th><th>封档</th></tr></thead>
+        <tbody><tr v-for="k in cards" :key="'c'+k.id"><td>{{k.source}}</td><td>{{k.path}}</td><td>v{{k.from_version}}→v{{k.to_version}}</td><td>{{k.resecored}}</td><td>{{k.status}}</td><td>{{k.sealed_at}}</td></tr></tbody></table>
+        <h3 style="margin-top:16px">滞后留痕</h3>
+        <table><thead><tr><th>类型</th><th>源</th><th>席位</th><th>详情</th><th>时间</th></tr></thead>
+        <tbody><tr v-for="e in events" :key="'e'+e.id"><td>{{e.kind}}</td><td>{{e.source}}</td><td>{{e.seat}}</td><td>{{e.detail}}</td><td>{{e.created_at}}</td></tr></tbody></table>
       </div>
     </main>
   </div>`
